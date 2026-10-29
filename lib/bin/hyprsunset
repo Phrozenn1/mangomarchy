@@ -1,0 +1,21 @@
+#!/bin/bash
+# Session-scoped hyprsunset compatibility wrapper for Omarchy MangoWC (`omarchy-mango`).
+# Delegates to /usr/bin/hyprsunset in Hyprland, or wlsunset in MangoWC.
+
+if [[ -z ${MANGO_INSTANCE_SIGNATURE:-} && ${HYPRLAND_INSTANCE_SIGNATURE:-} != mango_* ]]; then
+  if [[ -x /usr/bin/hyprsunset ]]; then
+    exec /usr/bin/hyprsunset "$@"
+  fi
+fi
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+SUNSET_STATE="$RUNTIME_DIR/omarchy-mango-sunset-temp"
+TEMP=6000
+[[ -r $SUNSET_STATE ]] && read -r TEMP <"$SUNSET_STATE"
+
+if (( TEMP < 6000 )); then
+  exec wlsunset -t "$(( TEMP - 1 ))" -T "$TEMP"
+else
+  # Idle daemon placeholder so `pgrep -x hyprsunset` succeeds when queried by nightlight service
+  exec sleep infinity
+fi

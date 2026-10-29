@@ -1,0 +1,101 @@
+#!/bin/bash
+# Session-scoped hyprctl compatibility wrapper for Omarchy MangoWC (`omarchy-mango`).
+# Delegates to /usr/bin/hyprctl when inside a native Hyprland session, and
+# translates commands via omarchy-mango-bridge / mmsg when in a MangoWC session.
+
+if [[ -z ${MANGO_INSTANCE_SIGNATURE:-} && ${HYPRLAND_INSTANCE_SIGNATURE:-} != mango_* ]]; then
+  if [[ -x /usr/bin/hyprctl ]]; then
+    exec /usr/bin/hyprctl "$@"
+  fi
+fi
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+MANGO_BASE="${MANGO_INSTANCE_SIGNATURE##*/}"
+MANGO_BASE="${MANGO_BASE%.sock}"
+SIG="${HYPRLAND_INSTANCE_SIGNATURE:-mango_${MANGO_BASE:-default}}"
+SOCK="$RUNTIME_DIR/hypr/$SIG/.socket.sock"
+SUNSET_STATE="$RUNTIME_DIR/omarchy-mango-sunset-temp"
+
+JSON_FLAG=0
+ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    -j|--json) JSON_FLAG=1 ;;
+    -q|--quiet) ;;
+    *) ARGS+=("$arg") ;;
+  esac
+done
+
+CMD="${ARGS[0]:-}"
+
+# 1. Nightlight (`hyprctl hyprsunset temperature [val]`) -> managed via wlsunset
+if [[ $CMD == "hyprsunset" ]]; then
+  SUB="${ARGS[1]:-}"
+  VAL="${ARGS[2]:-}"
+  if [[ $SUB == "temperature" ]]; then
+    if [[ -n $VAL ]]; then
+      printf '%s\n' "$VAL" >"$SUNSET_STATE"
+      pkill -x wlsunset 2>/dev/null || true
+      if (( VAL < 6000 )); then
+        low=$(( VAL - 1 ))
+        setsid wlsunset -t "$low" -T "$VAL" >/dev/null 2>&1 &
+      fi
+      echo "ok"
+      exit 0
+    else
+      if [[ -r $SUNSET_STATE ]]; then
+        cat "$SUNSET_STATE"
+      else
+        echo "6000"
+      fi
+      exit 0
+    fi
+  fi
+  echo "ok"
+  exit 0
+fi
+
+# 2. Talk to omarchy-mango-bridge over the Hyprland-compatible Unix socket
+if [[ -S $SOCK ]]; then
+  PREFIX=""
+  (( JSON_FLAG )) && PREFIX="j/"
+  REQ="${PREFIX}${ARGS[*]}"
+  if python3 - "$SOCK" "$REQ" <<'PY' 2>/dev/null; then
+import socket, sys
+sock_path, req = sys.argv[1], sys.argv[2]
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    s.settimeout(2.0)
+    s.connect(sock_path)
+    s.sendall(req.encode("utf-8"))
+    chunks = []
+    while True:
+        data = s.recv(65536)
+        if not data:
+            break
+        chunks.append(data)
+sys.stdout.write(b"".join(chunks).decode("utf-8", errors="ignore"))
+PY
+    exit 0
+  fi
+fi
+
+# 3. Direct mmsg fallback if bridge is still starting up
+case "$CMD" in
+  reload)
+    mmsg dispatch reload_config >/dev/null 2>&1 || true
+    echo "ok"
+    ;;
+  monitors)
+    if (( JSON_FLAG )); then
+      mmsg get all-monitors 2>/dev/null || echo '[]'
+    fi
+    ;;
+  clients)
+    if (( JSON_FLAG )); then
+      mmsg get all-clients 2>/dev/null || echo '[]'
+    fi
+    ;;
+  *)
+    echo "ok"
+    ;;
+esac

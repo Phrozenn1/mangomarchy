@@ -1,0 +1,773 @@
+#!/usr/bin/env python3
+"""
+omarchy-mango-bridge: Translates between MangoWC's `mmsg` IPC and Hyprland's
+`.socket.sock` (request/response) & `.socket2.sock` (event stream) protocol.
+
+This allows Omarchy's Quickshell (`omarchy-shell`), `omasnap`, and `omarchy-*`
+CLI scripts to run unmodified inside a MangoWC (`mangowm`) session.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SLOTS_PER_MONITOR = 10
+
+LAYOUT_CYCLE = ["scroller", "tile", "monocle", "grid", "dwindle"]
+SYMBOL_TO_LAYOUT = {
+    "S": "scroller",
+    "[S]": "scroller",
+    "scroller": "scroller",
+    "T": "tile",
+    "[]=": "tile",
+    "tile": "tile",
+    "M": "monocle",
+    "[M]": "monocle",
+    "monocle": "monocle",
+    "G": "grid",
+    "HHH": "grid",
+    "grid": "grid",
+    "D": "dwindle",
+    "[@]": "dwindle",
+    "dwindle": "dwindle",
+}
+
+
+def parse_mango_config_options(config_paths: list[Path] | None = None) -> dict[str, Any]:
+    """Read key visual options (border_radius, gappoh, animations) from Mango config."""
+    home = Path(os.environ.get("HOME", "~")).expanduser()
+    if config_paths is None:
+        config_paths = [
+            home / ".local/share/omarchy-mango/default/mango/looknfeel.conf",
+            home / ".config/mango/looknfeel.conf",
+            home / ".config/mango/config.conf",
+        ]
+
+    opts: dict[str, Any] = {
+        "border_radius": 0,
+        "gappoh": 10,
+        "animations": 1,
+    }
+    for path in config_paths:
+        if not path.is_file():
+            continue
+        try:
+            for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw_line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                k, v = [p.strip() for p in line.split("=", 1)]
+                if k in ("border_radius", "gap_outer_horizontal", "gappoh", "gappo", "animations"):
+                    try:
+                        val = int(float(v))
+                        if k in ("gap_outer_horizontal", "gappo"):
+                            opts["gappoh"] = val
+                        else:
+                            opts[k] = val
+                    except ValueError:
+                        pass
+        except OSError:
+            pass
+
+    no_gaps_flag = home / ".local/state/omarchy/toggles/hypr/window-no-gaps.lua"
+    if no_gaps_flag.exists():
+        opts["gappoh"] = 0
+
+    return opts
+
+
+def normalize_hex_address(raw_id: Any) -> str:
+    """Convert a MangoWC client id or pointer into a valid hex string for Quickshell."""
+    if isinstance(raw_id, int):
+        return f"0x{raw_id:x}"
+    s = str(raw_id or "").strip()
+    if s.startswith("0x") or s.startswith("0X"):
+        return s.lower()
+    try:
+        return f"0x{int(s):x}"
+    except ValueError:
+        # Hash fallback if string ID is non-numeric
+        h = abs(hash(s)) & 0xFFFFFFFF
+        return f"0x{h:x}"
+
+
+def build_state_snapshot(
+    raw_monitors: Any,
+    raw_tags: Any,
+    raw_clients: Any,
+    raw_devices: Any = None,
+    raw_kblayout: str = "us",
+) -> dict[str, Any]:
+    """
+    Transform raw `mmsg` JSON payloads into Hyprland-compatible data structures:
+      - monitors (`j/monitors`)
+      - workspaces (`j/workspaces`)
+      - activeworkspace (`j/activeworkspace`)
+      - clients (`j/clients`)
+      - activewindow (`j/activewindow`)
+      - devices (`j/devices`)
+      - monitor_workspaces_tsv (for ~/.local/state/omarchy/monitor-workspaces)
+    """
+    # 1. Extract monitor list
+    mon_list: list[dict[str, Any]] = []
+    if isinstance(raw_monitors, list):
+        mon_list = [m for m in raw_monitors if isinstance(m, dict)]
+    elif isinstance(raw_monitors, dict):
+        if isinstance(raw_monitors.get("monitors"), list):
+            mon_list = [m for m in raw_monitors["monitors"] if isinstance(m, dict)]
+        else:
+            mon_list = [raw_monitors]
+
+    if not mon_list:
+        mon_list = [
+            {
+                "id": 0,
+                "name": "eDP-1",
+                "description": "MangoWC Default Output",
+                "x": 0,
+                "y": 0,
+                "width": 1920,
+                "height": 1080,
+                "scale": 1.0,
+                "refresh": 60.0,
+                "transform": 0,
+                "active": True,
+                "focused": True,
+                "selected_tag": 1,
+                "layout_symbol": "S",
+            }
+        ]
+
+    # Map monitor name -> index block (0, 1, 2, ...)
+    mon_blocks: dict[str, int] = {}
+    monitors_out: list[dict[str, Any]] = []
+    monitor_tsv_lines: list[str] = []
+
+    # 2. Extract per-monitor tag info
+    # `raw_tags` can be a dict keyed by monitor name, a list of tag objects, or a dict with "tags"
+    tags_by_mon: dict[str, list[dict[str, Any]]] = {}
+    if isinstance(raw_tags, dict):
+        for k, v in raw_tags.items():
+            if isinstance(v, list):
+                tags_by_mon[k] = [t for t in v if isinstance(t, dict)]
+            elif isinstance(v, dict) and isinstance(v.get("tags"), list):
+                tags_by_mon[k] = [t for t in v["tags"] if isinstance(t, dict)]
+    elif isinstance(raw_tags, list):
+        for item in raw_tags:
+            if isinstance(item, dict):
+                mname = str(item.get("monitor") or item.get("output") or "")
+                tags_by_mon.setdefault(mname, []).append(item)
+
+    # 3. Extract clients first so we know window counts and fullscreen state per workspace
+    client_list: list[dict[str, Any]] = []
+    if isinstance(raw_clients, list):
+        client_list = [c for c in raw_clients if isinstance(c, dict)]
+    elif isinstance(raw_clients, dict) and isinstance(raw_clients.get("clients"), list):
+        client_list = [c for c in raw_clients["clients"] if isinstance(c, dict)]
+
+    for idx, m in enumerate(mon_list):
+        mname = str(m.get("name") or m.get("output") or f"DP-{idx + 1}")
+        mon_blocks[mname] = idx
+
+    # Build Hyprland clients & count per workspace
+    clients_out: list[dict[str, Any]] = []
+    ws_window_counts: dict[int, int] = {}
+    ws_fullscreen: dict[int, bool] = {}
+    ws_last_win: dict[int, tuple[str, str]] = {}
+    active_client_out: dict[str, Any] = {}
+
+    for c_idx, c in enumerate(client_list):
+        mname = str(c.get("monitor") or c.get("output") or (mon_list[0].get("name") if mon_list else "eDP-1"))
+        block = mon_blocks.get(mname, 0)
+        tag_num = int(c.get("tag") or c.get("tags") or 1)
+        # If tag is a bitmask (e.g. 1, 2, 4, 8...) convert bitmask to 1-based index if > 10 or power of 2
+        if tag_num > 9 and (tag_num & (tag_num - 1)) == 0:
+            tag_num = tag_num.bit_length()
+        tag_slot = max(1, min(SLOTS_PER_MONITOR, tag_num))
+        ws_id = block * SLOTS_PER_MONITOR + tag_slot
+
+        addr = normalize_hex_address(c.get("id") or c.get("address") or (0x1000 + c_idx))
+        x = int(c.get("x", 0))
+        y = int(c.get("y", 0))
+        w = int(c.get("width", c.get("w", 800)))
+        h = int(c.get("height", c.get("h", 600)))
+        appid = str(c.get("appid") or c.get("app_id") or c.get("class") or "app")
+        title = str(c.get("title") or appid)
+        is_floating = bool(c.get("is_floating") or c.get("floating") or c.get("isfloating") or False)
+        is_fullscreen = bool(
+            c.get("is_fullscreen")
+            or c.get("is_fakefullscreen")
+            or c.get("fullscreen")
+            or c.get("isfullscreen")
+            or False
+        )
+        is_focused = bool(c.get("is_focused") or c.get("focused") or c.get("focus") or c.get("active") or False)
+
+        hc = {
+            "address": addr,
+            "mapped": True,
+            "hidden": False,
+            "at": [x, y],
+            "size": [w, h],
+            "workspace": {"id": ws_id, "name": str(ws_id)},
+            "floating": is_floating,
+            "pseudo": False,
+            "monitor": block,
+            "class": appid,
+            "title": title,
+            "initialClass": appid,
+            "initialTitle": title,
+            "pid": int(c.get("pid", 0)),
+            "xwayland": bool(c.get("is_xwayland") or c.get("xwayland") or False),
+            "pinned": bool(c.get("is_global") or c.get("pinned") or False),
+            "fullscreen": 2 if is_fullscreen else 0,
+            "fullscreenClient": 2 if is_fullscreen else 0,
+            "grouped": [],
+            "tags": [],
+            "swallowing": "0x0",
+            "focusHistoryID": 0 if is_focused else c_idx + 1,
+        }
+        clients_out.append(hc)
+        ws_window_counts[ws_id] = ws_window_counts.get(ws_id, 0) + 1
+        if is_fullscreen:
+            ws_fullscreen[ws_id] = True
+        if is_focused or ws_id not in ws_last_win:
+            ws_last_win[ws_id] = (addr, title)
+        if is_focused:
+            active_client_out = hc
+
+    if not active_client_out and clients_out:
+        active_client_out = clients_out[0]
+
+    # 4. Build monitors and workspaces
+    workspaces_out: list[dict[str, Any]] = []
+    seen_ws_ids: set[int] = set()
+    focused_ws_out: dict[str, Any] = {}
+
+    for idx, m in enumerate(mon_list):
+        mname = str(m.get("name") or m.get("output") or f"DP-{idx + 1}")
+        desc = str(m.get("description") or m.get("make") or mname)
+        is_focused = bool(
+            m.get("is_focused")
+            or m.get("focused")
+            or m.get("is_active")
+            or m.get("active")
+            or (idx == 0 and len(mon_list) == 1)
+        )
+
+        # Determine active tag on this monitor
+        raw_active_tags = m.get("active_tags")
+        if isinstance(raw_active_tags, list) and raw_active_tags:
+            active_tag = int(raw_active_tags[0])
+        elif isinstance(raw_active_tags, int) and raw_active_tags > 0:
+            active_tag = raw_active_tags.bit_length() if raw_active_tags > 9 else raw_active_tags
+        else:
+            active_tag = int(m.get("selected_tag") or m.get("tag") or 1)
+        m_tags = tags_by_mon.get(mname) or tags_by_mon.get("tags") or []
+        for t in m_tags:
+            t_id = int(t.get("tag_index") or t.get("id") or t.get("tag") or t.get("index") or 0)
+            if t.get("is_active") or t.get("active") or t.get("selected") or t.get("focused"):
+                if 1 <= t_id <= SLOTS_PER_MONITOR:
+                    active_tag = t_id
+            if t.get("client_count", 0) or t.get("clients", 0) or t.get("occupied"):
+                occ_ws_id = idx * SLOTS_PER_MONITOR + max(1, min(SLOTS_PER_MONITOR, t_id))
+                ws_window_counts.setdefault(occ_ws_id, 1)
+
+        active_slot = max(1, min(SLOTS_PER_MONITOR, active_tag))
+        active_ws_id = idx * SLOTS_PER_MONITOR + active_slot
+
+        scale = float(m.get("scale") or 1.0)
+        width = int(m.get("width") or 1920)
+        height = int(m.get("height") or 1080)
+        transform = int(m.get("transform") or 0)
+
+        mon_obj = {
+            "id": idx,
+            "name": mname,
+            "description": desc,
+            "make": str(m.get("make") or ""),
+            "model": str(m.get("model") or ""),
+            "serial": str(m.get("serial") or ""),
+            "width": width,
+            "height": height,
+            "refreshRate": float(m.get("refresh") or m.get("refresh_rate") or 60.0),
+            "x": int(m.get("x") or 0),
+            "y": int(m.get("y") or 0),
+            "activeWorkspace": {"id": active_ws_id, "name": str(active_ws_id)},
+            "specialWorkspace": {"id": 0, "name": ""},
+            "reserved": [0, 0, 0, 0],
+            "scale": scale,
+            "transform": transform,
+            "focused": is_focused,
+            "dpmsStatus": bool(m.get("dpms", True)),
+            "vrr": bool(m.get("vrr", False)),
+            "solitary": "0",
+            "activelyTearing": False,
+            "directScanoutTo": "0",
+            "disabled": not bool(m.get("enabled", True)),
+            "currentFormat": "XRGB8888",
+            "mirrorOf": "none",
+            "availableModes": [f"{width}x{height}@60.00Hz"],
+        }
+        monitors_out.append(mon_obj)
+        monitor_tsv_lines.append(f"{idx}\t{mname}\t{desc}")
+
+        # Always populate at least the active workspace and any occupied workspaces for this monitor
+        candidate_slots = {active_slot}
+        for ws_id in ws_window_counts:
+            if (ws_id - 1) // SLOTS_PER_MONITOR == idx:
+                candidate_slots.add((ws_id - 1) % SLOTS_PER_MONITOR + 1)
+
+        # Determine active layout on this monitor
+        raw_layout = str(m.get("layout_name") or m.get("layout_symbol") or m.get("layout") or "S").strip()
+        mango_layout = SYMBOL_TO_LAYOUT.get(raw_layout, "scroller")
+        tiled_layout = "scrolling" if mango_layout == "scroller" else "dwindle"
+
+        for slot in sorted(candidate_slots):
+            ws_id = idx * SLOTS_PER_MONITOR + slot
+            if ws_id in seen_ws_ids:
+                continue
+            seen_ws_ids.add(ws_id)
+            last_addr, last_title = ws_last_win.get(ws_id, ("0x0", ""))
+            ws_obj = {
+                "id": ws_id,
+                "name": str(ws_id),
+                "monitor": mname,
+                "monitorID": idx,
+                "windows": ws_window_counts.get(ws_id, 0),
+                "hasfullscreen": ws_fullscreen.get(ws_id, False),
+                "lastwindow": last_addr,
+                "lastwindowtitle": last_title,
+                "tiledLayout": tiled_layout,
+            }
+            workspaces_out.append(ws_obj)
+            if is_focused and slot == active_slot:
+                focused_ws_out = ws_obj
+
+    if not focused_ws_out and workspaces_out:
+        focused_ws_out = workspaces_out[0]
+
+    # 5. Build devices (`j/devices`)
+    kb_layout_clean = (raw_kblayout or "English (US)").strip() or "English (US)"
+    devices_out = {
+        "mice": [],
+        "keyboards": [
+            {
+                "address": "0x1",
+                "name": "mango-virtual-keyboard",
+                "rules": "",
+                "model": "",
+                "layout": "us",
+                "variant": "",
+                "options": "",
+                "active_keymap": kb_layout_clean,
+                "capsLock": False,
+                "numLock": True,
+                "main": True,
+            }
+        ],
+        "tablets": [],
+        "touch": [],
+        "switches": [],
+    }
+
+    return {
+        "monitors": monitors_out,
+        "workspaces": workspaces_out,
+        "activeworkspace": focused_ws_out,
+        "clients": clients_out,
+        "activewindow": active_client_out,
+        "devices": devices_out,
+        "monitor_workspaces_tsv": "\n".join(monitor_tsv_lines) + "\n",
+    }
+
+
+def translate_dispatch_to_mmsg(dispatch_str: str, state: dict[str, Any] | None = None) -> list[list[str]]:
+    """
+    Translate a Hyprland or Omarchy Lua `dispatch` string into one or more
+    `mmsg` command argument lists.
+    """
+    expr = dispatch_str.strip()
+    if expr.startswith("dispatch "):
+        expr = expr[len("dispatch ") :].strip()
+
+    # 0. Omarchy Lua workspace layout mode: o.workspace_mode({ workspace = "1", mode = "scrolling" })
+    m_ws_mode = re.search(r'o\.workspace_mode\(.*mode\s*=\s*"([a-z]+)"', expr)
+    if m_ws_mode:
+        mode = m_ws_mode.group(1)
+        if mode == "scrolling":
+            return [["mmsg", "dispatch", "setlayout,scroller"]]
+        if mode == "floating":
+            return [["mmsg", "dispatch", "setlayout,monocle"]]
+        return [["mmsg", "dispatch", "setlayout,tile"]]
+
+    # 1. Omarchy Lua workspace focus: o.workspaces.focus(3, "eDP-1") or o.workspaces.focus(3)
+    m_ws_focus = re.search(r"o\.workspaces\.focus\(\s*(\d+)", expr)
+    if m_ws_focus:
+        slot = max(1, min(9, int(m_ws_focus.group(1))))
+        return [["mmsg", "dispatch", f"view,{slot}"]]
+
+    # 2. Omarchy Lua move window to workspace: o.workspaces.move_window(3...)
+    m_ws_move = re.search(r"o\.workspaces\.move_window\(\s*(\d+)", expr)
+    if m_ws_move:
+        slot = max(1, min(9, int(m_ws_move.group(1))))
+        return [["mmsg", "dispatch", f"tag,{slot}"]]
+
+    # 3. Hyprland Lua focus: hl.dsp.focus({ workspace = "2" }) or direction = "l"
+    m_hl_ws = re.search(r'workspace\s*=\s*"?([0-9m+\-]+)"?', expr)
+    if m_hl_ws:
+        target = m_hl_ws.group(1)
+        if target in ("m+1", "+1", "r+1"):
+            return [["mmsg", "dispatch", "viewtoleft_have_client"]]
+        if target in ("m-1", "-1", "r-1"):
+            return [["mmsg", "dispatch", "viewtoright_have_client"]]
+        try:
+            ws_num = int(target)
+            slot = (ws_num - 1) % SLOTS_PER_MONITOR + 1
+            return [["mmsg", "dispatch", f"view,{min(9, slot)}"]]
+        except ValueError:
+            pass
+
+    m_hl_dir = re.search(r'direction\s*=\s*"([lrud])"', expr)
+    if m_hl_dir:
+        d = {"l": "left", "r": "right", "u": "up", "d": "down"}[m_hl_dir.group(1)]
+        return [["mmsg", "dispatch", f"focusdir,{d}"]]
+
+    # 4. Close window
+    if "window.close" in expr or expr.startswith("killactive") or expr.startswith("closewindow"):
+        return [["mmsg", "dispatch", "killclient"]]
+
+    # 5. Fullscreen / float
+    if "window.fullscreen" in expr or expr.startswith("fullscreen"):
+        if "maximized" in expr:
+            return [["mmsg", "dispatch", "togglemaximizescreen"]]
+        return [["mmsg", "dispatch", "togglefullscreen"]]
+
+    if "window.float" in expr or expr.startswith("togglefloating"):
+        return [["mmsg", "dispatch", "togglefloating"]]
+
+    # 6. Exec command: hl.dsp.exec_cmd("...") or exec ...
+    m_exec_lua = re.search(r'hl\.dsp\.exec_cmd\(\s*(["\'])(.*?)\1\s*\)', expr)
+    if m_exec_lua:
+        cmd = m_exec_lua.group(2)
+        return [["bash", "-c", f"{cmd} &"]]
+
+    if expr.startswith("exec "):
+        cmd = expr[5:].strip()
+        return [["bash", "-c", f"{cmd} &"]]
+
+    # 7. Plain Hyprland workspace N / movetoworkspace N
+    m_plain_ws = re.match(r"^workspace\s+(\d+)$", expr)
+    if m_plain_ws:
+        slot = (int(m_plain_ws.group(1)) - 1) % SLOTS_PER_MONITOR + 1
+        return [["mmsg", "dispatch", f"view,{min(9, slot)}"]]
+
+    m_plain_mv = re.match(r"^movetoworkspacesilent\s+(\d+)|^movetoworkspace\s+(\d+)", expr)
+    if m_plain_mv:
+        num = int(m_plain_mv.group(1) or m_plain_mv.group(2))
+        slot = (num - 1) % SLOTS_PER_MONITOR + 1
+        return [["mmsg", "dispatch", f"tag,{min(9, slot)}"]]
+
+    return []
+
+
+class MangoHyprBridge:
+    """Asyncio server managing `.socket.sock` and `.socket2.sock` for a MangoWC session."""
+
+    def __init__(self, signature: str) -> None:
+        self.signature = signature
+        runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        self.sock_dir = runtime_dir / "hypr" / signature
+        self.sock_dir.mkdir(parents=True, exist_ok=True)
+        self.req_sock_path = self.sock_dir / ".socket.sock"
+        self.evt_sock_path = self.sock_dir / ".socket2.sock"
+
+        state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+        self.omarchy_state_dir = state_home / "omarchy"
+        self.omarchy_state_dir.mkdir(parents=True, exist_ok=True)
+        self.monitor_ws_file = self.omarchy_state_dir / "monitor-workspaces"
+        self.layout_state_file = self.omarchy_state_dir / "mango-layout"
+
+        self.event_writers: set[asyncio.StreamWriter] = set()
+        self.cached_state: dict[str, Any] = build_state_snapshot([], {}, [])
+
+    async def run_mmsg_json(self, *args: str) -> Any:
+        """Execute `mmsg` and parse JSON output if available."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "mmsg",
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.5)
+            text = stdout.decode("utf-8", errors="ignore").strip()
+            if not text:
+                return None
+            return json.loads(text)
+        except Exception:
+            return None
+
+    async def refresh_state(self) -> dict[str, Any]:
+        """Poll `mmsg` and rebuild the cached Hyprland-compatible state snapshot."""
+        raw_monitors, raw_clients, raw_kblayout = await asyncio.gather(
+            self.run_mmsg_json("get", "all-monitors"),
+            self.run_mmsg_json("get", "all-clients"),
+            self.run_mmsg_json("get", "keyboardlayout"),
+        )
+        raw_tags = await self.run_mmsg_json("get", "all-tags")
+        if raw_tags is None and isinstance(raw_monitors, list):
+            raw_tags = {}
+            for m in raw_monitors:
+                if isinstance(m, dict) and m.get("name"):
+                    t = await self.run_mmsg_json("get", "tags", str(m["name"]))
+                    if t is not None:
+                        raw_tags[str(m["name"])] = t
+
+        kb_str = "English (US)"
+        if isinstance(raw_kblayout, dict):
+            kb_str = str(raw_kblayout.get("layout") or raw_kblayout.get("keymap") or "English (US)")
+        elif isinstance(raw_kblayout, str) and raw_kblayout:
+            kb_str = raw_kblayout
+
+        snapshot = build_state_snapshot(
+            raw_monitors=raw_monitors,
+            raw_tags=raw_tags,
+            raw_clients=raw_clients,
+            raw_kblayout=kb_str,
+        )
+        self.cached_state = snapshot
+
+        try:
+            self.monitor_ws_file.write_text(snapshot["monitor_workspaces_tsv"], encoding="utf-8")
+        except OSError:
+            pass
+
+        return snapshot
+
+    async def broadcast_event(self, event_name: str, data: str = "") -> None:
+        """Send `EVENT>>DATA\\n` to all connected `.socket2.sock` clients."""
+        line = f"{event_name}>>{data}\n".encode("utf-8")
+        dead: list[asyncio.StreamWriter] = []
+        for writer in list(self.event_writers):
+            try:
+                writer.write(line)
+                await writer.drain()
+            except Exception:
+                dead.append(writer)
+        for writer in dead:
+            self.event_writers.discard(writer)
+
+    async def handle_request_str(self, raw_req: str) -> str:
+        """Process a single request over `.socket.sock` and return the response string."""
+        req = raw_req.strip()
+        is_json = False
+        if req.startswith("[[BATCH]]"):
+            parts = [p for p in req[len("[[BATCH]]") :].split(";") if p.strip()]
+            out = []
+            for p in parts:
+                out.append(await self.handle_request_str(p))
+            return "\n\n\n".join(out)
+
+        # Strip Hyprland flags prefix like "j/" or "-j/"
+        if "/" in req:
+            flags_part, cmd_part = req.split("/", 1)
+            if "j" in flags_part:
+                is_json = True
+            req = cmd_part.strip()
+
+        state = await self.refresh_state()
+
+        if req == "monitors":
+            return json.dumps(state["monitors"]) if is_json else "ok"
+        if req == "workspaces":
+            return json.dumps(state["workspaces"]) if is_json else "ok"
+        if req == "activeworkspace":
+            return json.dumps(state["activeworkspace"]) if is_json else "ok"
+        if req == "clients":
+            return json.dumps(state["clients"]) if is_json else "ok"
+        if req == "activewindow":
+            return json.dumps(state["activewindow"]) if is_json else "ok"
+        if req == "devices":
+            return json.dumps(state["devices"]) if is_json else "active keymap: English (US)\n"
+        if req == "binds":
+            return json.dumps([]) if is_json else ""
+        if req.startswith("plugin list"):
+            return json.dumps([{"name": "hyprbars"}]) if is_json else "Plugin hyprbars"
+        if req == "version":
+            ver = {"branch": "main", "commit": "mangowm", "tag": "0.18.2", "flags": []}
+            return json.dumps(ver) if is_json else "MangoWC (Omarchy Bridge)"
+
+        if req.startswith("getoption "):
+            opt_name = req[len("getoption ") :].strip()
+            opts = parse_mango_config_options()
+            if opt_name == "decoration:rounding":
+                val = int(opts.get("border_radius", 0))
+                return json.dumps({"option": opt_name, "int": val, "set": True})
+            if opt_name == "general:gaps_out":
+                val = int(opts.get("gappoh", 10))
+                return json.dumps({"option": opt_name, "int": val, "custom": f"{val} {val} {val} {val}", "set": True})
+            if opt_name == "animations:enabled":
+                enabled = bool(opts.get("animations", 1))
+                return json.dumps({"option": opt_name, "int": 1 if enabled else 0, "bool": enabled, "set": True})
+            return json.dumps({"option": opt_name, "int": 0, "bool": False, "set": False})
+
+        if req == "reload":
+            try:
+                subprocess.Popen(["mmsg", "dispatch", "reload_config"])
+            except OSError:
+                pass
+            await self.broadcast_event("configreloaded", "")
+            return "ok"
+
+        if req.startswith("switchxkblayout"):
+            try:
+                subprocess.Popen(["mmsg", "dispatch", "switch_keyboard_layout"])
+            except OSError:
+                pass
+            return "ok"
+
+        if req.startswith("dispatch ") or req.startswith("eval "):
+            cmds = translate_dispatch_to_mmsg(req, state)
+            for cmd in cmds:
+                try:
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError:
+                    pass
+            await asyncio.sleep(0.03)
+            new_state = await self.refresh_state()
+            ws = new_state.get("activeworkspace") or {}
+            if ws.get("id"):
+                await self.broadcast_event("workspacev2", f"{ws['id']},{ws['name']}")
+                await self.broadcast_event("focusedmonv2", f"{ws.get('monitor', 'eDP-1')},{ws['id']}")
+            return "ok"
+
+        return "ok"
+
+    async def on_req_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            data = await asyncio.wait_for(reader.read(65536), timeout=2.0)
+            req = data.decode("utf-8", errors="ignore")
+            resp = await self.handle_request_str(req)
+            writer.write(resp.encode("utf-8"))
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def on_evt_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        self.event_writers.add(writer)
+        try:
+            # Keep connection open until peer disconnects
+            while await reader.read(1024):
+                pass
+        except Exception:
+            pass
+        finally:
+            self.event_writers.discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    async def watch_mmsg_stream(self, target: str) -> None:
+        """Continuously watch a `mmsg watch <target>` stream and emit `.socket2.sock` events."""
+        while True:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "mmsg",
+                    "watch",
+                    target,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                assert proc.stdout is not None
+                async for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    state = await self.refresh_state()
+                    ws = state.get("activeworkspace") or {}
+                    ws_id = ws.get("id", 1)
+                    mon_name = ws.get("monitor", "eDP-1")
+                    if target in ("all-tags", "all-monitors"):
+                        await self.broadcast_event("workspacev2", f"{ws_id},{ws_id}")
+                        await self.broadcast_event("focusedmonv2", f"{mon_name},{ws_id}")
+                    elif target in ("all-clients", "focusing-client"):
+                        win = state.get("activewindow") or {}
+                        addr = str(win.get("address", "0x0")).removeprefix("0x")
+                        await self.broadcast_event("activewindowv2", addr)
+                        await self.broadcast_event(
+                            "activewindow",
+                            f"{win.get('class', '')},{win.get('title', '')}",
+                        )
+                    elif target == "keyboardlayout":
+                        devs = state.get("devices", {}).get("keyboards", [])
+                        km = devs[0].get("active_keymap", "English (US)") if devs else "English (US)"
+                        await self.broadcast_event("activelayout", f"mango-virtual-keyboard,{km}")
+                await proc.wait()
+            except Exception:
+                pass
+            await asyncio.sleep(2.0)
+
+    async def serve(self) -> None:
+        for sock_path in (self.req_sock_path, self.evt_sock_path):
+            if sock_path.exists():
+                sock_path.unlink()
+
+        await self.refresh_state()
+
+        req_server = await asyncio.start_unix_server(self.on_req_client, path=str(self.req_sock_path))
+        evt_server = await asyncio.start_unix_server(self.on_evt_client, path=str(self.evt_sock_path))
+
+        watchers = [
+            asyncio.create_task(self.watch_mmsg_stream("all-monitors")),
+            asyncio.create_task(self.watch_mmsg_stream("all-clients")),
+            asyncio.create_task(self.watch_mmsg_stream("focusing-client")),
+            asyncio.create_task(self.watch_mmsg_stream("keyboardlayout")),
+        ]
+
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop_event.set)
+
+        async with req_server, evt_server:
+            await stop_event.wait()
+
+        for task in watchers:
+            task.cancel()
+
+
+def main() -> int:
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not sig:
+        mango_sig = Path(os.environ.get("MANGO_INSTANCE_SIGNATURE", "default")).stem
+        sig = f"mango_{mango_sig}"
+        os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = sig
+
+    bridge = MangoHyprBridge(sig)
+    try:
+        asyncio.run(bridge.serve())
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

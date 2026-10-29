@@ -1,0 +1,242 @@
+#!/bin/bash
+# omarchy-mango-dm: Switch Omarchy's login display manager between `ly` and `sddm`.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
+if [[ -d $REPO_ROOT/share ]]; then
+  SHARE_DIR="$REPO_ROOT/share"
+elif [[ -d /usr/share/omarchy-mango ]]; then
+  SHARE_DIR="/usr/share/omarchy-mango"
+else
+  SHARE_DIR="$HOME/.local/share/omarchy-mango"
+fi
+
+TTY_NAME="tty1"
+
+usage() {
+  cat <<USAGE
+Usage: omarchy-mango-dm <use-ly | use-sddm | status> [--tty tty1|tty2]
+
+Commands:
+  use-ly    Configure and enable Ly (minimalist TUI display manager) for the
+            next boot, with Plymouth handoff and Omarchy keyring compatibility.
+  use-sddm  Restore SDDM as the active display manager for the next boot.
+  status    Show current display manager unit states and available sessions.
+USAGE
+}
+
+run_priv() {
+  if (( EUID == 0 )); then
+    "$@"
+  elif sudo -n true 2>/dev/null; then
+    sudo "$@"
+  elif [[ -n ${WAYLAND_DISPLAY:-} || -n ${DISPLAY:-} ]] && command -v pkexec >/dev/null 2>&1; then
+    pkexec "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+ACTION="${1:-status}"
+shift || true
+
+while (( $# > 0 )); do
+  case "$1" in
+    --tty)
+      TTY_NAME="${2:-tty1}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+show_status() {
+  echo "=== Display Manager Status ==="
+  for unit in sddm.service ly@tty1.service ly@tty2.service ly.service getty@tty1.service; do
+    state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+    [[ -n $state ]] || state="not-found"
+    printf "  %-22s : %s\n" "$unit" "$state"
+  done
+  if [[ -L /etc/systemd/system/display-manager.service ]]; then
+    echo "  display-manager.service -> $(readlink /etc/systemd/system/display-manager.service)"
+  fi
+  echo
+  echo "=== Available Wayland Sessions ==="
+  for desktop in /usr/share/wayland-sessions/*.desktop /usr/local/share/wayland-sessions/*.desktop; do
+    [[ -f $desktop ]] || continue
+    name=$(sed -n 's/^Name=//p' "$desktop" | head -n1)
+    exec_cmd=$(sed -n 's/^Exec=//p' "$desktop" | head -n1)
+    printf "  - %-28s (%s) -> %s\n" "${name:-$(basename "$desktop")}" "$desktop" "$exec_cmd"
+  done
+}
+
+case "$ACTION" in
+  status)
+    show_status
+    ;;
+
+  use-ly)
+    TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+    SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/omarchy-mango.desktop"
+
+    # Build a single privileged setup script so the user is prompted at most once
+    PRIV_SCRIPT=$(mktemp /tmp/omarchy-mango-dm.XXXXXX.sh)
+    trap 'rm -f "$PRIV_SCRIPT"' EXIT
+
+    cat >"$PRIV_SCRIPT" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+# 1. Install required packages if missing
+MISSING=()
+for pkg in ly mangowm wlsunset wlr-randr wlopm socat jq; do
+  pacman -Q "\$pkg" &>/dev/null || MISSING+=("\$pkg")
+done
+if (( \${#MISSING[@]} > 0 )); then
+  pacman -S --noconfirm --needed "\${MISSING[@]}"
+fi
+
+# 2. Ensure omarchy-mango-session and omarchy-mango-bridge are in /usr/bin (or /usr/local/bin)
+# so Ly can execute omarchy-mango-session system-wide before user PATH is loaded
+install -Dm755 "$SCRIPT_DIR/omarchy-mango-session" /usr/bin/omarchy-mango-session
+install -Dm755 "$SCRIPT_DIR/omarchy-mango-bridge" /usr/bin/omarchy-mango-bridge
+install -Dm755 "$SCRIPT_DIR/omarchy-mango-init" /usr/bin/omarchy-mango-init
+if [[ -f "$SCRIPT_DIR/omarchy-mango-dm" ]]; then
+  install -Dm755 "$SCRIPT_DIR/omarchy-mango-dm" /usr/bin/omarchy-mango-dm
+fi
+
+if [[ -d "$REPO_ROOT/lib/bin" ]]; then
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprctl" /usr/lib/omarchy-mango/bin/hyprctl
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprsunset" /usr/lib/omarchy-mango/bin/hyprsunset
+fi
+
+if [[ -d "$SHARE_DIR/default/mango" && "$SHARE_DIR" != "/usr/share/omarchy-mango" ]]; then
+  install -dm755 /usr/share/omarchy-mango
+  cp -r "$SHARE_DIR/config" /usr/share/omarchy-mango/
+  cp -r "$SHARE_DIR/default" /usr/share/omarchy-mango/
+  cp -r "$SHARE_DIR/themed" /usr/share/omarchy-mango/
+  [[ -d "$SHARE_DIR/ly" ]] && cp -r "$SHARE_DIR/ly" /usr/share/omarchy-mango/
+fi
+
+# 3. Install Wayland session entries for Omarchy (MangoWC) and Omarchy (Hyprland)
+if [[ -f "$SESSION_DESKTOP_SRC" ]]; then
+  install -Dm644 "$SESSION_DESKTOP_SRC" /usr/share/wayland-sessions/omarchy-mango.desktop
+fi
+if [[ ! -f /usr/share/wayland-sessions/omarchy.desktop ]]; then
+  if [[ -f /usr/local/share/wayland-sessions/omarchy.desktop ]]; then
+    install -Dm644 /usr/local/share/wayland-sessions/omarchy.desktop /usr/share/wayland-sessions/omarchy.desktop
+  elif [[ -f /usr/share/omarchy/default/wayland-sessions/omarchy.desktop ]]; then
+    install -Dm644 /usr/share/omarchy/default/wayland-sessions/omarchy.desktop /usr/share/wayland-sessions/omarchy.desktop
+  fi
+fi
+
+# 4. Configure /etc/ly/config.ini with minimalist Omarchy settings
+mkdir -p /etc/ly
+if [[ -f /etc/ly/config.ini && ! -f /etc/ly/config.ini.omarchy.bak ]]; then
+  cp /etc/ly/config.ini /etc/ly/config.ini.omarchy.bak
+fi
+
+if [[ -f /etc/ly/config.ini ]]; then
+  set_ly_key() {
+    local key="\$1" val="\$2"
+    if grep -qE "^[[:space:]#]*\${key}[[:space:]]*=" /etc/ly/config.ini; then
+      sed -i -E "s|^[[:space:]#]*(\${key})[[:space:]]*=.*|\1 = \${val}|" /etc/ly/config.ini
+    else
+      printf '%s = %s\n' "\$key" "\$val" >> /etc/ly/config.ini
+    fi
+  }
+  set_ly_key "animation" "none"
+  set_ly_key "animate" "false"
+  set_ly_key "clock" "%a %d %b %H:%M"
+  set_ly_key "clear_password" "true"
+  set_ly_key "hide_version_string" "true"
+  set_ly_key "load" "true"
+  set_ly_key "save" "true"
+  set_ly_key "waylandsessions" "/usr/share/wayland-sessions"
+else
+  install -Dm644 "$SHARE_DIR/ly/config.ini" /etc/ly/config.ini
+fi
+
+# Pre-seed saved user if /etc/ly/save.ini is absent
+if [[ ! -f /etc/ly/save.ini && -n "$TARGET_USER" ]]; then
+  printf 'user = %s\nsession_index = 0\n' "$TARGET_USER" > /etc/ly/save.ini
+fi
+
+# 5. Configure /etc/pam.d/ly to match Omarchy's passwordless GNOME Keyring behavior
+if [[ -f /etc/pam.d/ly ]]; then
+  sed -i '/-auth.*pam_gnome_keyring\.so/d' /etc/pam.d/ly
+  sed -i '/-password.*pam_gnome_keyring\.so/d' /etc/pam.d/ly
+  if ! grep -q 'pam_gnome_keyring\.so.*auto_start' /etc/pam.d/ly; then
+    printf -- '-session   optional     pam_gnome_keyring.so auto_start\n' >> /etc/pam.d/ly
+  fi
+fi
+
+# 6. Determine Ly systemd unit (ly@tty1.service on ly 1.4+, or ly.service)
+LY_UNIT="ly@${TTY_NAME}.service"
+if [[ ! -f /usr/lib/systemd/system/ly@.service && -f /usr/lib/systemd/system/ly.service ]]; then
+  LY_UNIT="ly.service"
+fi
+
+# Add Plymouth boot-splash handoff drop-in so Plymouth quits cleanly before Ly draws on TTY
+mkdir -p "/etc/systemd/system/\${LY_UNIT}.d"
+cat >"/etc/systemd/system/\${LY_UNIT}.d/omarchy.conf" <<DROPIN
+[Unit]
+After=systemd-user-sessions.service plymouth-quit.service systemd-logind.service getty@${TTY_NAME}.service
+Wants=plymouth-quit.service
+Conflicts=getty@${TTY_NAME}.service
+DROPIN
+
+systemctl daemon-reload
+systemctl disable sddm.service 2>/dev/null || true
+systemctl disable "getty@${TTY_NAME}.service" 2>/dev/null || true
+systemctl enable "\$LY_UNIT"
+EOF
+    chmod +x "$PRIV_SCRIPT"
+    echo ":: Configuring Ly display manager and Omarchy MangoWC session..."
+    run_priv "$PRIV_SCRIPT"
+    echo
+    show_status
+    echo
+    echo ":: Ly is now enabled for the next boot (on ${TTY_NAME})!"
+    echo "   Use Left/Right arrows in Ly to choose between 'Omarchy (MangoWC)' and 'Omarchy (Hyprland uwsm)'."
+    echo "   To revert to SDDM at any time, run: omarchy-mango-dm use-sddm"
+    ;;
+
+  use-sddm)
+    PRIV_SCRIPT=$(mktemp /tmp/omarchy-mango-dm.XXXXXX.sh)
+    trap 'rm -f "$PRIV_SCRIPT"' EXIT
+
+    cat >"$PRIV_SCRIPT" <<EOF
+#!/bin/bash
+set -euo pipefail
+systemctl disable ly@tty1.service 2>/dev/null || true
+systemctl disable ly@tty2.service 2>/dev/null || true
+systemctl disable ly.service 2>/dev/null || true
+rm -rf /etc/systemd/system/ly@tty1.service.d /etc/systemd/system/ly@tty2.service.d
+systemctl enable getty@tty1.service 2>/dev/null || true
+systemctl enable sddm.service
+systemctl daemon-reload
+EOF
+    chmod +x "$PRIV_SCRIPT"
+    echo ":: Restoring SDDM as the active display manager..."
+    run_priv "$PRIV_SCRIPT"
+    echo
+    show_status
+    ;;
+
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac

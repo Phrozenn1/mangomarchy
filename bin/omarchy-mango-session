@@ -1,0 +1,47 @@
+#!/bin/bash
+# omarchy-mango-session: Entrypoint for the Omarchy (MangoWC) Wayland session.
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+
+# Source Omarchy's standard environment bootstrap so OMARCHY_PATH and mise shims are on PATH
+if [[ -f /usr/share/omarchy/default/bash/env-bootstrap ]]; then
+  source /usr/share/omarchy/default/bash/env-bootstrap
+fi
+
+# Ensure user-space configs and theme files exist
+if [[ -x $SCRIPT_DIR/omarchy-mango-init ]]; then
+  "$SCRIPT_DIR/omarchy-mango-init" --ensure
+elif command -v omarchy-mango-init >/dev/null 2>&1; then
+  omarchy-mango-init --ensure
+fi
+
+# Prepend the session-scoped hyprctl / hyprsunset wrapper directory to PATH
+if [[ -d $REPO_ROOT/lib/bin ]]; then
+  export PATH="$REPO_ROOT/lib/bin:$SCRIPT_DIR:$PATH"
+elif [[ -d /usr/lib/omarchy-mango/bin ]]; then
+  export PATH="/usr/lib/omarchy-mango/bin:$PATH"
+elif [[ -d $HOME/.local/state/omarchy/mango-lib-bin ]]; then
+  export PATH="$HOME/.local/state/omarchy/mango-lib-bin:$PATH"
+fi
+
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=mango:wlroots
+export XDG_SESSION_DESKTOP=mango
+export QT_QPA_PLATFORM=wayland
+export ELECTRON_OZONE_PLATFORM_HINT=wayland
+export MOZ_ENABLE_WAYLAND=1
+
+# Deterministic Hyprland instance signature for the MangoWC <-> Quickshell IPC bridge
+export HYPRLAND_INSTANCE_SIGNATURE="mango_${XDG_SESSION_ID:-$$}"
+export OMARCHY_SESSION_ID="$HYPRLAND_INSTANCE_SIGNATURE"
+
+MANGO_BIN=$(command -v mango || true)
+if [[ -z $MANGO_BIN ]]; then
+  echo "Error: 'mango' binary (from package 'mangowm') not found on PATH." >&2
+  exit 1
+fi
+
+exec "$MANGO_BIN" -c "$HOME/.config/mango/config.conf" "$@"
