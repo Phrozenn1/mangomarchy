@@ -38,10 +38,26 @@ export MOZ_ENABLE_WAYLAND=1
 export HYPRLAND_INSTANCE_SIGNATURE="mango_${XDG_SESSION_ID:-$$}"
 export OMARCHY_SESSION_ID="$HYPRLAND_INSTANCE_SIGNATURE"
 
+# Pre-set MANGO_INSTANCE_SIGNATURE to the socket path that `exec mango` (same PID $$) will bind
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export MANGO_INSTANCE_SIGNATURE="$RUNTIME_DIR/mango-$$.sock"
+
 MANGO_BIN=$(command -v mango || true)
 if [[ -z $MANGO_BIN ]]; then
   echo "Error: 'mango' binary (from package 'mangowm') not found on PATH." >&2
   exit 1
+fi
+
+# Start the Hyprland <-> MangoWC IPC socket bridge and wait for .socket.sock/.socket2.sock
+# before starting MangoWC so owed.service and omarchy-launch-shell connect without races.
+BRIDGE_BIN=$(command -v omarchy-mango-bridge || true)
+if [[ -n $BRIDGE_BIN ]]; then
+  "$BRIDGE_BIN" >/dev/null 2>&1 &
+  SOCK_DIR="$RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE"
+  for _ in {1..25}; do
+    [[ -S "$SOCK_DIR/.socket.sock" && -S "$SOCK_DIR/.socket2.sock" ]] && break
+    sleep 0.04
+  done
 fi
 
 exec "$MANGO_BIN" -c "$HOME/.config/mango/config.conf" "$@"

@@ -91,6 +91,32 @@ class TestMangoBridge(unittest.TestCase):
         self.assertIn("0\teDP-1\tBuilt-in Display", snap["monitor_workspaces_tsv"])
         self.assertIn("1\tDP-1\tExternal 4K", snap["monitor_workspaces_tsv"])
 
+    def test_build_state_snapshot_mango_018_embedded_tags(self) -> None:
+        raw_monitors = {
+            "monitors": [
+                {
+                    "name": "eDP-1",
+                    "active": True,
+                    "width": 1920,
+                    "height": 1200,
+                    "scale": 1.25,
+                    "layout_symbol": "S",
+                    "active_tags": [3],
+                    "keyboardlayout": "Norwegian",
+                    "tags": [
+                        {"index": 1, "is_active": False, "is_urgent": False, "layout": "S", "client_count": 2},
+                        {"index": 2, "is_active": False, "is_urgent": False, "layout": "S", "client_count": 0},
+                        {"index": 3, "is_active": True, "is_urgent": False, "layout": "S", "client_count": 1},
+                    ],
+                }
+            ]
+        }
+        snap = bridge.build_state_snapshot(raw_monitors, None, [], raw_kblayout="Norwegian")
+        self.assertEqual(snap["activeworkspace"]["id"], 3)
+        ws_ids = [w["id"] for w in snap["workspaces"]]
+        self.assertEqual(ws_ids, [1, 3])
+        self.assertEqual(snap["devices"]["keyboards"][0]["active_keymap"], "Norwegian")
+
     def test_translate_dispatch_to_mmsg(self) -> None:
         self.assertEqual(
             bridge.translate_dispatch_to_mmsg('o.workspaces.focus(4, "eDP-1")'),

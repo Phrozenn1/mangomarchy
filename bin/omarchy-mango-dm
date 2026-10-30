@@ -18,12 +18,14 @@ TTY_NAME="tty1"
 
 usage() {
   cat <<USAGE
-Usage: omarchy-mango-dm <use-ly | use-sddm | status> [--tty tty1|tty2]
+Usage: omarchy-mango-dm <use-ly | use-sddm | sync | status> [--tty tty1|tty2]
 
 Commands:
   use-ly    Configure and enable Ly (minimalist TUI display manager) for the
             next boot, with Plymouth handoff and Omarchy keyring compatibility.
   use-sddm  Restore SDDM as the active display manager for the next boot.
+  sync      Install/update omarchy-mango binaries and share files into /usr
+            without changing the active display manager.
   status    Show current display manager unit states and available sessions.
 USAGE
 }
@@ -211,6 +213,41 @@ EOF
     echo ":: Ly is now enabled for the next boot (on ${TTY_NAME})!"
     echo "   Use Left/Right arrows in Ly to choose between 'Omarchy (MangoWC)' and 'Omarchy (Hyprland uwsm)'."
     echo "   To revert to SDDM at any time, run: omarchy-mango-dm use-sddm"
+    ;;
+
+  sync)
+    SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/omarchy-mango.desktop"
+    PRIV_SCRIPT=$(mktemp /tmp/omarchy-mango-dm.XXXXXX.sh)
+    trap 'rm -f "$PRIV_SCRIPT"' EXIT
+
+    cat >"$PRIV_SCRIPT" <<EOF
+#!/bin/bash
+set -euo pipefail
+install -Dm755 "$SCRIPT_DIR/omarchy-mango-session" /usr/bin/omarchy-mango-session
+install -Dm755 "$SCRIPT_DIR/omarchy-mango-bridge" /usr/bin/omarchy-mango-bridge
+install -Dm755 "$SCRIPT_DIR/omarchy-mango-init" /usr/bin/omarchy-mango-init
+if [[ -f "$SCRIPT_DIR/omarchy-mango-dm" ]]; then
+  install -Dm755 "$SCRIPT_DIR/omarchy-mango-dm" /usr/bin/omarchy-mango-dm
+fi
+if [[ -d "$REPO_ROOT/lib/bin" ]]; then
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprctl" /usr/lib/omarchy-mango/bin/hyprctl
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprsunset" /usr/lib/omarchy-mango/bin/hyprsunset
+fi
+if [[ -d "$SHARE_DIR/default/mango" && "$SHARE_DIR" != "/usr/share/omarchy-mango" ]]; then
+  install -dm755 /usr/share/omarchy-mango
+  cp -r "$SHARE_DIR/config" /usr/share/omarchy-mango/
+  cp -r "$SHARE_DIR/default" /usr/share/omarchy-mango/
+  cp -r "$SHARE_DIR/themed" /usr/share/omarchy-mango/
+  [[ -d "$SHARE_DIR/ly" ]] && cp -r "$SHARE_DIR/ly" /usr/share/omarchy-mango/
+fi
+if [[ -f "$SESSION_DESKTOP_SRC" ]]; then
+  install -Dm644 "$SESSION_DESKTOP_SRC" /usr/share/wayland-sessions/omarchy-mango.desktop
+fi
+EOF
+    chmod +x "$PRIV_SCRIPT"
+    echo ":: Syncing Omarchy MangoWC binaries and share files into /usr..."
+    run_priv "$PRIV_SCRIPT"
+    echo ":: Sync complete."
     ;;
 
   use-sddm)

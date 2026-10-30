@@ -153,14 +153,21 @@ def build_state_snapshot(
     monitor_tsv_lines: list[str] = []
 
     # 2. Extract per-monitor tag info
-    # `raw_tags` can be a dict keyed by monitor name, a list of tag objects, or a dict with "tags"
+    # `raw_tags` can be a dict keyed by monitor name, `{"all_tags": [{"monitor": ..., "tags": [...]}]}`,
+    # or a list of tag objects; `m["tags"]` in `raw_monitors` also embeds per-monitor tags in mango 0.18+.
     tags_by_mon: dict[str, list[dict[str, Any]]] = {}
     if isinstance(raw_tags, dict):
-        for k, v in raw_tags.items():
-            if isinstance(v, list):
-                tags_by_mon[k] = [t for t in v if isinstance(t, dict)]
-            elif isinstance(v, dict) and isinstance(v.get("tags"), list):
-                tags_by_mon[k] = [t for t in v["tags"] if isinstance(t, dict)]
+        if isinstance(raw_tags.get("all_tags"), list):
+            for entry in raw_tags["all_tags"]:
+                if isinstance(entry, dict) and isinstance(entry.get("tags"), list):
+                    mname = str(entry.get("monitor") or entry.get("output") or "")
+                    tags_by_mon[mname] = [t for t in entry["tags"] if isinstance(t, dict)]
+        else:
+            for k, v in raw_tags.items():
+                if isinstance(v, list):
+                    tags_by_mon[k] = [t for t in v if isinstance(t, dict)]
+                elif isinstance(v, dict) and isinstance(v.get("tags"), list):
+                    tags_by_mon[k] = [t for t in v["tags"] if isinstance(t, dict)]
     elif isinstance(raw_tags, list):
         for item in raw_tags:
             if isinstance(item, dict):
@@ -272,7 +279,9 @@ def build_state_snapshot(
             active_tag = raw_active_tags.bit_length() if raw_active_tags > 9 else raw_active_tags
         else:
             active_tag = int(m.get("selected_tag") or m.get("tag") or 1)
-        m_tags = tags_by_mon.get(mname) or tags_by_mon.get("tags") or []
+        m_tags = tags_by_mon.get(mname) or tags_by_mon.get("tags") or (
+            [t for t in m["tags"] if isinstance(t, dict)] if isinstance(m.get("tags"), list) else []
+        )
         for t in m_tags:
             t_id = int(t.get("tag_index") or t.get("id") or t.get("tag") or t.get("index") or 0)
             if t.get("is_active") or t.get("active") or t.get("selected") or t.get("focused"):
@@ -500,8 +509,23 @@ class MangoHyprBridge:
         self.event_writers: set[asyncio.StreamWriter] = set()
         self.cached_state: dict[str, Any] = build_state_snapshot([], {}, [])
 
+    def _ensure_mango_socket_env(self) -> None:
+        """Ensure MANGO_INSTANCE_SIGNATURE points to a live mango-*.sock in XDG_RUNTIME_DIR."""
+        cur = os.environ.get("MANGO_INSTANCE_SIGNATURE", "")
+        if cur and Path(cur).is_socket():
+            return
+        runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        candidates = sorted(
+            (p for p in runtime_dir.glob("mango-*.sock") if p.is_socket()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            os.environ["MANGO_INSTANCE_SIGNATURE"] = str(candidates[0])
+
     async def run_mmsg_json(self, *args: str) -> Any:
         """Execute `mmsg` and parse JSON output if available."""
+        self._ensure_mango_socket_env()
         try:
             proc = await asyncio.create_subprocess_exec(
                 "mmsg",
@@ -519,25 +543,27 @@ class MangoHyprBridge:
 
     async def refresh_state(self) -> dict[str, Any]:
         """Poll `mmsg` and rebuild the cached Hyprland-compatible state snapshot."""
-        raw_monitors, raw_clients, raw_kblayout = await asyncio.gather(
+        raw_monitors, raw_clients = await asyncio.gather(
             self.run_mmsg_json("get", "all-monitors"),
             self.run_mmsg_json("get", "all-clients"),
-            self.run_mmsg_json("get", "keyboardlayout"),
         )
-        raw_tags = await self.run_mmsg_json("get", "all-tags")
-        if raw_tags is None and isinstance(raw_monitors, list):
-            raw_tags = {}
-            for m in raw_monitors:
-                if isinstance(m, dict) and m.get("name"):
-                    t = await self.run_mmsg_json("get", "tags", str(m["name"]))
-                    if t is not None:
-                        raw_tags[str(m["name"])] = t
+        mon_list = (
+            raw_monitors.get("monitors")
+            if isinstance(raw_monitors, dict) and isinstance(raw_monitors.get("monitors"), list)
+            else (raw_monitors if isinstance(raw_monitors, list) else [])
+        )
+        has_embedded_tags = bool(mon_list and isinstance(mon_list[0], dict) and isinstance(mon_list[0].get("tags"), list))
+        raw_tags = None if has_embedded_tags else await self.run_mmsg_json("get", "all-tags")
 
         kb_str = "English (US)"
-        if isinstance(raw_kblayout, dict):
-            kb_str = str(raw_kblayout.get("layout") or raw_kblayout.get("keymap") or "English (US)")
-        elif isinstance(raw_kblayout, str) and raw_kblayout:
-            kb_str = raw_kblayout
+        if mon_list and isinstance(mon_list[0], dict) and mon_list[0].get("keyboardlayout"):
+            kb_str = str(mon_list[0]["keyboardlayout"])
+        else:
+            raw_kblayout = await self.run_mmsg_json("get", "keyboardlayout")
+            if isinstance(raw_kblayout, dict):
+                kb_str = str(raw_kblayout.get("layout") or raw_kblayout.get("keymap") or "English (US)")
+            elif isinstance(raw_kblayout, str) and raw_kblayout:
+                kb_str = raw_kblayout
 
         snapshot = build_state_snapshot(
             raw_monitors=raw_monitors,
@@ -688,6 +714,7 @@ class MangoHyprBridge:
     async def watch_mmsg_stream(self, target: str) -> None:
         """Continuously watch a `mmsg watch <target>` stream and emit `.socket2.sock` events."""
         while True:
+            self._ensure_mango_socket_env()
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "mmsg",
