@@ -1,5 +1,5 @@
 #!/bin/bash
-# omarchy-mango-session: Entrypoint for the Omarchy (MangoWC) Wayland session.
+# mangomarchy-session: Entrypoint for the Mangomarchy (MangoWC) Wayland session.
 
 set -euo pipefail
 
@@ -12,8 +12,10 @@ if [[ -f /usr/share/omarchy/default/bash/env-bootstrap ]]; then
 fi
 
 # Ensure user-space configs and theme files exist
-if [[ -x $SCRIPT_DIR/omarchy-mango-init ]]; then
-  "$SCRIPT_DIR/omarchy-mango-init" --ensure
+if [[ -x $SCRIPT_DIR/mangomarchy-init ]]; then
+  "$SCRIPT_DIR/mangomarchy-init" --ensure
+elif command -v mangomarchy-init >/dev/null 2>&1; then
+  mangomarchy-init --ensure
 elif command -v omarchy-mango-init >/dev/null 2>&1; then
   omarchy-mango-init --ensure
 fi
@@ -21,8 +23,12 @@ fi
 # Prepend the session-scoped hyprctl / hyprsunset wrapper directory to PATH
 if [[ -d $REPO_ROOT/lib/bin ]]; then
   export PATH="$REPO_ROOT/lib/bin:$SCRIPT_DIR:$PATH"
+elif [[ -d /usr/lib/mangomarchy/bin ]]; then
+  export PATH="/usr/lib/mangomarchy/bin:$PATH"
 elif [[ -d /usr/lib/omarchy-mango/bin ]]; then
   export PATH="/usr/lib/omarchy-mango/bin:$PATH"
+elif [[ -d $HOME/.local/state/omarchy/mangomarchy-lib-bin ]]; then
+  export PATH="$HOME/.local/state/omarchy/mangomarchy-lib-bin:$PATH"
 elif [[ -d $HOME/.local/state/omarchy/mango-lib-bin ]]; then
   export PATH="$HOME/.local/state/omarchy/mango-lib-bin:$PATH"
 fi
@@ -50,7 +56,11 @@ fi
 
 # Start the Hyprland <-> MangoWC IPC socket bridge and wait for .socket.sock/.socket2.sock
 # before starting MangoWC so owed.service and omarchy-launch-shell connect without races.
-BRIDGE_BIN=$(command -v omarchy-mango-bridge || true)
+BRIDGE_BIN=$(command -v mangomarchy-bridge || command -v omarchy-mango-bridge || true)
+if [[ -z $BRIDGE_BIN && -x $SCRIPT_DIR/mangomarchy-bridge ]]; then
+  BRIDGE_BIN="$SCRIPT_DIR/mangomarchy-bridge"
+fi
+
 if [[ -n $BRIDGE_BIN ]]; then
   "$BRIDGE_BIN" >/dev/null 2>&1 &
   SOCK_DIR="$RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE"

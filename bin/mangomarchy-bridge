@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-omarchy-mango-bridge: Translates between MangoWC's `mmsg` IPC and Hyprland's
+mangomarchy-bridge: Translates between MangoWC's `mmsg` IPC and Hyprland's
 `.socket.sock` (request/response) & `.socket2.sock` (event stream) protocol.
 
 This allows Omarchy's Quickshell (`omarchy-shell`), `omasnap`, and `omarchy-*`
-CLI scripts to run unmodified inside a MangoWC (`mangowm`) session.
+CLI scripts to run unmodified inside a Mangomarchy / MangoWC (`mangowm`) session.
 """
 
 from __future__ import annotations
@@ -47,7 +47,9 @@ def parse_mango_config_options(config_paths: list[Path] | None = None) -> dict[s
     home = Path(os.environ.get("HOME", "~")).expanduser()
     if config_paths is None:
         config_paths = [
+            home / ".local/share/mangomarchy/default/mango/looknfeel.conf",
             home / ".local/share/omarchy-mango/default/mango/looknfeel.conf",
+            Path("/usr/share/mangomarchy/default/mango/looknfeel.conf"),
             home / ".config/mango/looknfeel.conf",
             home / ".config/mango/config.conf",
         ]

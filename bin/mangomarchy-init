@@ -1,5 +1,5 @@
 #!/bin/bash
-# omarchy-mango-init: Initialize or refresh user-space MangoWC configs and
+# mangomarchy-init: Initialize or refresh user-space MangoWC configs and
 # Omarchy theme integration (~/.config/mango, ~/.config/omarchy/themed).
 
 set -euo pipefail
@@ -10,11 +10,14 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 if [[ -d $REPO_ROOT/share/default/mango ]]; then
   SHARE_DIR="$REPO_ROOT/share"
   LIB_BIN_DIR="$REPO_ROOT/lib/bin"
+elif [[ -d /usr/share/mangomarchy/default/mango ]]; then
+  SHARE_DIR="/usr/share/mangomarchy"
+  LIB_BIN_DIR="/usr/lib/mangomarchy/bin"
 elif [[ -d /usr/share/omarchy-mango/default/mango ]]; then
   SHARE_DIR="/usr/share/omarchy-mango"
   LIB_BIN_DIR="/usr/lib/omarchy-mango/bin"
 else
-  echo "Error: Could not locate omarchy-mango share directory." >&2
+  echo "Error: Could not locate mangomarchy share directory." >&2
   exit 1
 fi
 
@@ -25,19 +28,20 @@ for arg in "$@"; do
     --force|--reset) MODE="force" ;;
     -h|--help)
       cat <<USAGE
-Usage: omarchy-mango-init [--ensure | --force]
+Usage: mangomarchy-init [--ensure | --force]
 
 Options:
   --ensure  Create missing ~/.config/mango files and theme templates without
             overwriting existing user customizations (default).
-  --force   Backup and reset ~/.config/mango files to Omarchy MangoWC defaults.
+  --force   Backup and reset ~/.config/mango files to Mangomarchy defaults.
 USAGE
       exit 0
       ;;
   esac
 done
 
-USER_SHARE_LINK="$HOME/.local/share/omarchy-mango"
+USER_SHARE_LINK="$HOME/.local/share/mangomarchy"
+LEGACY_SHARE_LINK="$HOME/.local/share/omarchy-mango"
 MANGO_CONFIG_DIR="$HOME/.config/mango"
 USER_THEMED_DIR="$HOME/.config/omarchy/themed"
 CURRENT_THEME_DIR="$HOME/.local/state/omarchy/current/theme"
@@ -45,9 +49,12 @@ HOOKS_DIR="$HOME/.config/omarchy/hooks/theme-set.d"
 
 mkdir -p "$(dirname "$USER_SHARE_LINK")" "$MANGO_CONFIG_DIR" "$USER_THEMED_DIR" "$HOOKS_DIR"
 
-# 1. Point ~/.local/share/omarchy-mango at the active share directory
+# 1. Point ~/.local/share/mangomarchy at the active share directory (and backward compat link)
 ln -snf "$SHARE_DIR" "$USER_SHARE_LINK"
+ln -snf "$USER_SHARE_LINK" "$LEGACY_SHARE_LINK"
+
 mkdir -p "$HOME/.local/state/omarchy"
+ln -snf "$LIB_BIN_DIR" "$HOME/.local/state/omarchy/mangomarchy-lib-bin"
 ln -snf "$LIB_BIN_DIR" "$HOME/.local/state/omarchy/mango-lib-bin"
 
 # 2. Populate ~/.config/mango/
@@ -91,10 +98,12 @@ EOF
 render_current_theme
 
 # 5. Install theme-set hook to reload MangoWC whenever `omarchy theme set` runs
-cat >"$HOOKS_DIR/50-mango-reload.sh" <<'EOF'
+# Clean up old legacy hook if present
+rm -f "$HOOKS_DIR/50-mango-reload.sh"
+cat >"$HOOKS_DIR/50-mangomarchy-reload.sh" <<'EOF'
 #!/bin/bash
 if [[ -n ${MANGO_INSTANCE_SIGNATURE:-} ]] || pgrep -x mango >/dev/null 2>&1; then
   mmsg dispatch reload_config >/dev/null 2>&1 || true
 fi
 EOF
-chmod +x "$HOOKS_DIR/50-mango-reload.sh"
+chmod +x "$HOOKS_DIR/50-mangomarchy-reload.sh"

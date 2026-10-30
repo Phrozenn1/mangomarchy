@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh: Install omarchy-mango (either in user-space + system session or via PKGBUILD)
+# install.sh: Install mangomarchy (either in user-space + system session or via PKGBUILD)
 
 set -euo pipefail
 
@@ -50,31 +50,48 @@ if (( INSTALL_DEPS )); then
 fi
 
 if [[ $MODE == "pkg" ]]; then
-  echo ":: Building and installing omarchy-mango Arch package..."
+  echo ":: Building and installing mangomarchy Arch package..."
   (cd "$REPO_ROOT" && makepkg -si --needed)
-  omarchy-mango-init --ensure
-  echo ":: Done! Select 'Omarchy (MangoWC)' at login or run 'omarchy-mango-session'."
+  mangomarchy-init --ensure
+  echo ":: Done! Select 'Mangomarchy' at login or run 'mangomarchy-session'."
   exit 0
 fi
 
-echo ":: Linking omarchy-mango binaries into ~/.local/bin..."
+echo ":: Linking mangomarchy binaries into ~/.local/bin..."
 mkdir -p "$HOME/.local/bin"
+
+# Remove legacy omarchy-mango symlinks from ~/.local/bin
+rm -f "$HOME/.local/bin/omarchy-mango-bridge" \
+      "$HOME/.local/bin/omarchy-mango-dm" \
+      "$HOME/.local/bin/omarchy-mango-init" \
+      "$HOME/.local/bin/omarchy-mango-session"
+
 for bin_file in "$REPO_ROOT/bin/"*; do
-  ln -snf "$bin_file" "$HOME/.local/bin/$(basename "$bin_file")"
+  name=$(basename "$bin_file")
+  ln -snf "$bin_file" "$HOME/.local/bin/$name"
+  # Also maintain backward compatibility links
+  legacy_name="${name/mangomarchy/omarchy-mango}"
+  if [[ "$legacy_name" != "$name" ]]; then
+    ln -snf "$bin_file" "$HOME/.local/bin/$legacy_name"
+  fi
 done
 
 echo ":: Initializing ~/.config/mango and Omarchy theme templates..."
-"$REPO_ROOT/bin/omarchy-mango-init" --ensure
+"$REPO_ROOT/bin/mangomarchy-init" --ensure
+
+# Install user-space Wayland session entry
+mkdir -p "$HOME/.local/share/wayland-sessions"
+install -Dm644 "$REPO_ROOT/share/wayland-sessions/mangomarchy.desktop" "$HOME/.local/share/wayland-sessions/mangomarchy.desktop"
+rm -f "$HOME/.local/share/wayland-sessions/omarchy-mango.desktop"
 
 if (( USE_LY )); then
-  "$REPO_ROOT/bin/omarchy-mango-dm" use-ly
-elif [[ -d /usr/share/wayland-sessions ]] && [[ ! -f /usr/share/wayland-sessions/omarchy-mango.desktop ]]; then
-  echo ":: Installing /usr/share/wayland-sessions/omarchy-mango.desktop (requires sudo)..."
-  sudo install -Dm644 "$REPO_ROOT/share/wayland-sessions/omarchy-mango.desktop" \
-    /usr/share/wayland-sessions/omarchy-mango.desktop || true
+  "$REPO_ROOT/bin/mangomarchy-dm" use-ly
+elif (( EUID == 0 )) && [[ -d /usr/share/wayland-sessions ]]; then
+  install -Dm644 "$REPO_ROOT/share/wayland-sessions/mangomarchy.desktop" /usr/share/wayland-sessions/mangomarchy.desktop
+  rm -f /usr/share/wayland-sessions/omarchy-mango.desktop
 fi
 
-echo ":: omarchy-mango setup complete!"
+echo ":: mangomarchy setup complete!"
 echo "   - Configs: ~/.config/mango/config.conf"
 echo "   - Theme template: ~/.config/omarchy/themed/mango-theme.conf.tpl"
-echo "   - Run 'omarchy-mango-session' or select 'Omarchy (MangoWC)' in your display manager."
+echo "   - Run 'mangomarchy-session' or select 'Mangomarchy' in your display manager."

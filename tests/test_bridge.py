@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for omarchy-mango-bridge state snapshot and dispatch translation."""
+"""Unit tests for mangomarchy-bridge state snapshot and dispatch translation."""
 
 import importlib.machinery
 import importlib.util
@@ -7,8 +7,11 @@ from pathlib import Path
 import unittest
 
 
-BRIDGE_PATH = Path(__file__).resolve().parent.parent / "bin" / "omarchy-mango-bridge"
-loader = importlib.machinery.SourceFileLoader("omarchy_mango_bridge", str(BRIDGE_PATH))
+_bin_dir = Path(__file__).resolve().parent.parent / "bin"
+BRIDGE_PATH = _bin_dir / "mangomarchy-bridge"
+if not BRIDGE_PATH.is_file():
+    BRIDGE_PATH = _bin_dir / "omarchy-mango-bridge"
+loader = importlib.machinery.SourceFileLoader("mangomarchy_bridge", str(BRIDGE_PATH))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 assert spec is not None
 bridge = importlib.util.module_from_spec(spec)

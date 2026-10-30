@@ -1,5 +1,5 @@
 #!/bin/bash
-# omarchy-mango-dm: Switch Omarchy's login display manager between `ly` and `sddm`.
+# mangomarchy-dm: Switch Omarchy's login display manager between `ly` and `sddm`.
 
 set -euo pipefail
 
@@ -8,23 +8,25 @@ REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 if [[ -d $REPO_ROOT/share ]]; then
   SHARE_DIR="$REPO_ROOT/share"
+elif [[ -d /usr/share/mangomarchy ]]; then
+  SHARE_DIR="/usr/share/mangomarchy"
 elif [[ -d /usr/share/omarchy-mango ]]; then
   SHARE_DIR="/usr/share/omarchy-mango"
 else
-  SHARE_DIR="$HOME/.local/share/omarchy-mango"
+  SHARE_DIR="$HOME/.local/share/mangomarchy"
 fi
 
 TTY_NAME="tty1"
 
 usage() {
   cat <<USAGE
-Usage: omarchy-mango-dm <use-ly | use-sddm | sync | status> [--tty tty1|tty2]
+Usage: mangomarchy-dm <use-ly | use-sddm | sync | status> [--tty tty1|tty2]
 
 Commands:
   use-ly    Configure and enable Ly (minimalist TUI display manager) for the
             next boot, with Plymouth handoff and Omarchy keyring compatibility.
   use-sddm  Restore SDDM as the active display manager for the next boot.
-  sync      Install/update omarchy-mango binaries and share files into /usr
+  sync      Install/update mangomarchy binaries and share files into /usr
             without changing the active display manager.
   status    Show current display manager unit states and available sessions.
 USAGE
@@ -41,6 +43,13 @@ run_priv() {
     sudo "$@"
   fi
 }
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
 
 ACTION="${1:-status}"
 shift || true
@@ -90,10 +99,11 @@ case "$ACTION" in
 
   use-ly)
     TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
-    SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/omarchy-mango.desktop"
+    SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/mangomarchy.desktop"
+    [[ -f "$SESSION_DESKTOP_SRC" ]] || SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/omarchy-mango.desktop"
 
     # Build a single privileged setup script so the user is prompted at most once
-    PRIV_SCRIPT=$(mktemp /tmp/omarchy-mango-dm.XXXXXX.sh)
+    PRIV_SCRIPT=$(mktemp /tmp/mangomarchy-dm.XXXXXX.sh)
     trap 'rm -f "$PRIV_SCRIPT"' EXIT
 
     cat >"$PRIV_SCRIPT" <<EOF
@@ -109,31 +119,38 @@ if (( \${#MISSING[@]} > 0 )); then
   pacman -S --noconfirm --needed "\${MISSING[@]}"
 fi
 
-# 2. Ensure omarchy-mango-session and omarchy-mango-bridge are in /usr/bin (or /usr/local/bin)
-# so Ly can execute omarchy-mango-session system-wide before user PATH is loaded
-install -Dm755 "$SCRIPT_DIR/omarchy-mango-session" /usr/bin/omarchy-mango-session
-install -Dm755 "$SCRIPT_DIR/omarchy-mango-bridge" /usr/bin/omarchy-mango-bridge
-install -Dm755 "$SCRIPT_DIR/omarchy-mango-init" /usr/bin/omarchy-mango-init
-if [[ -f "$SCRIPT_DIR/omarchy-mango-dm" ]]; then
-  install -Dm755 "$SCRIPT_DIR/omarchy-mango-dm" /usr/bin/omarchy-mango-dm
+# 2. Ensure mangomarchy-session and mangomarchy-bridge are in /usr/bin (or /usr/local/bin)
+# so Ly can execute mangomarchy-session system-wide before user PATH is loaded
+install -Dm755 "$SCRIPT_DIR/mangomarchy-session" /usr/bin/mangomarchy-session
+install -Dm755 "$SCRIPT_DIR/mangomarchy-bridge" /usr/bin/mangomarchy-bridge
+install -Dm755 "$SCRIPT_DIR/mangomarchy-init" /usr/bin/mangomarchy-init
+if [[ -f "$SCRIPT_DIR/mangomarchy-dm" ]]; then
+  install -Dm755 "$SCRIPT_DIR/mangomarchy-dm" /usr/bin/mangomarchy-dm
 fi
+
+# Backward-compatibility symlinks in /usr/bin
+ln -snf /usr/bin/mangomarchy-session /usr/bin/omarchy-mango-session
+ln -snf /usr/bin/mangomarchy-bridge /usr/bin/omarchy-mango-bridge
+ln -snf /usr/bin/mangomarchy-init /usr/bin/omarchy-mango-init
+ln -snf /usr/bin/mangomarchy-dm /usr/bin/omarchy-mango-dm
 
 if [[ -d "$REPO_ROOT/lib/bin" ]]; then
-  install -Dm755 "$REPO_ROOT/lib/bin/hyprctl" /usr/lib/omarchy-mango/bin/hyprctl
-  install -Dm755 "$REPO_ROOT/lib/bin/hyprsunset" /usr/lib/omarchy-mango/bin/hyprsunset
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprctl" /usr/lib/mangomarchy/bin/hyprctl
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprsunset" /usr/lib/mangomarchy/bin/hyprsunset
 fi
 
-if [[ -d "$SHARE_DIR/default/mango" && "$SHARE_DIR" != "/usr/share/omarchy-mango" ]]; then
-  install -dm755 /usr/share/omarchy-mango
-  cp -r "$SHARE_DIR/config" /usr/share/omarchy-mango/
-  cp -r "$SHARE_DIR/default" /usr/share/omarchy-mango/
-  cp -r "$SHARE_DIR/themed" /usr/share/omarchy-mango/
-  [[ -d "$SHARE_DIR/ly" ]] && cp -r "$SHARE_DIR/ly" /usr/share/omarchy-mango/
+if [[ -d "$SHARE_DIR/default/mango" && "$SHARE_DIR" != "/usr/share/mangomarchy" ]]; then
+  install -dm755 /usr/share/mangomarchy
+  cp -r "$SHARE_DIR/config" /usr/share/mangomarchy/
+  cp -r "$SHARE_DIR/default" /usr/share/mangomarchy/
+  cp -r "$SHARE_DIR/themed" /usr/share/mangomarchy/
+  [[ -d "$SHARE_DIR/ly" ]] && cp -r "$SHARE_DIR/ly" /usr/share/mangomarchy/
 fi
 
-# 3. Install Wayland session entries for Omarchy (MangoWC) and Omarchy (Hyprland)
+# 3. Install Wayland session entries for Mangomarchy and Omarchy (Hyprland)
 if [[ -f "$SESSION_DESKTOP_SRC" ]]; then
-  install -Dm644 "$SESSION_DESKTOP_SRC" /usr/share/wayland-sessions/omarchy-mango.desktop
+  install -Dm644 "$SESSION_DESKTOP_SRC" /usr/share/wayland-sessions/mangomarchy.desktop
+  rm -f /usr/share/wayland-sessions/omarchy-mango.desktop
 fi
 if [[ ! -f /usr/share/wayland-sessions/omarchy.desktop ]]; then
   if [[ -f /usr/local/share/wayland-sessions/omarchy.desktop ]]; then
@@ -211,47 +228,56 @@ EOF
     show_status
     echo
     echo ":: Ly is now enabled for the next boot (on ${TTY_NAME})!"
-    echo "   Use Left/Right arrows in Ly to choose between 'Omarchy (MangoWC)' and 'Omarchy (Hyprland uwsm)'."
-    echo "   To revert to SDDM at any time, run: omarchy-mango-dm use-sddm"
+    echo "   Use Left/Right arrows in Ly to choose between 'Mangomarchy' and 'Omarchy (Hyprland uwsm)'."
+    echo "   To revert to SDDM at any time, run: mangomarchy-dm use-sddm"
     ;;
 
   sync)
-    SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/omarchy-mango.desktop"
-    PRIV_SCRIPT=$(mktemp /tmp/omarchy-mango-dm.XXXXXX.sh)
+    SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/mangomarchy.desktop"
+    [[ -f "$SESSION_DESKTOP_SRC" ]] || SESSION_DESKTOP_SRC="$SHARE_DIR/wayland-sessions/omarchy-mango.desktop"
+    PRIV_SCRIPT=$(mktemp /tmp/mangomarchy-dm.XXXXXX.sh)
     trap 'rm -f "$PRIV_SCRIPT"' EXIT
 
     cat >"$PRIV_SCRIPT" <<EOF
 #!/bin/bash
 set -euo pipefail
-install -Dm755 "$SCRIPT_DIR/omarchy-mango-session" /usr/bin/omarchy-mango-session
-install -Dm755 "$SCRIPT_DIR/omarchy-mango-bridge" /usr/bin/omarchy-mango-bridge
-install -Dm755 "$SCRIPT_DIR/omarchy-mango-init" /usr/bin/omarchy-mango-init
-if [[ -f "$SCRIPT_DIR/omarchy-mango-dm" ]]; then
-  install -Dm755 "$SCRIPT_DIR/omarchy-mango-dm" /usr/bin/omarchy-mango-dm
+install -Dm755 "$SCRIPT_DIR/mangomarchy-session" /usr/bin/mangomarchy-session
+install -Dm755 "$SCRIPT_DIR/mangomarchy-bridge" /usr/bin/mangomarchy-bridge
+install -Dm755 "$SCRIPT_DIR/mangomarchy-init" /usr/bin/mangomarchy-init
+if [[ -f "$SCRIPT_DIR/mangomarchy-dm" ]]; then
+  install -Dm755 "$SCRIPT_DIR/mangomarchy-dm" /usr/bin/mangomarchy-dm
 fi
+
+# Backward-compatibility symlinks in /usr/bin
+ln -snf /usr/bin/mangomarchy-session /usr/bin/omarchy-mango-session
+ln -snf /usr/bin/mangomarchy-bridge /usr/bin/omarchy-mango-bridge
+ln -snf /usr/bin/mangomarchy-init /usr/bin/omarchy-mango-init
+ln -snf /usr/bin/mangomarchy-dm /usr/bin/omarchy-mango-dm
+
 if [[ -d "$REPO_ROOT/lib/bin" ]]; then
-  install -Dm755 "$REPO_ROOT/lib/bin/hyprctl" /usr/lib/omarchy-mango/bin/hyprctl
-  install -Dm755 "$REPO_ROOT/lib/bin/hyprsunset" /usr/lib/omarchy-mango/bin/hyprsunset
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprctl" /usr/lib/mangomarchy/bin/hyprctl
+  install -Dm755 "$REPO_ROOT/lib/bin/hyprsunset" /usr/lib/mangomarchy/bin/hyprsunset
 fi
-if [[ -d "$SHARE_DIR/default/mango" && "$SHARE_DIR" != "/usr/share/omarchy-mango" ]]; then
-  install -dm755 /usr/share/omarchy-mango
-  cp -r "$SHARE_DIR/config" /usr/share/omarchy-mango/
-  cp -r "$SHARE_DIR/default" /usr/share/omarchy-mango/
-  cp -r "$SHARE_DIR/themed" /usr/share/omarchy-mango/
-  [[ -d "$SHARE_DIR/ly" ]] && cp -r "$SHARE_DIR/ly" /usr/share/omarchy-mango/
+if [[ -d "$SHARE_DIR/default/mango" && "$SHARE_DIR" != "/usr/share/mangomarchy" ]]; then
+  install -dm755 /usr/share/mangomarchy
+  cp -r "$SHARE_DIR/config" /usr/share/mangomarchy/
+  cp -r "$SHARE_DIR/default" /usr/share/mangomarchy/
+  cp -r "$SHARE_DIR/themed" /usr/share/mangomarchy/
+  [[ -d "$SHARE_DIR/ly" ]] && cp -r "$SHARE_DIR/ly" /usr/share/mangomarchy/
 fi
 if [[ -f "$SESSION_DESKTOP_SRC" ]]; then
-  install -Dm644 "$SESSION_DESKTOP_SRC" /usr/share/wayland-sessions/omarchy-mango.desktop
+  install -Dm644 "$SESSION_DESKTOP_SRC" /usr/share/wayland-sessions/mangomarchy.desktop
+  rm -f /usr/share/wayland-sessions/omarchy-mango.desktop
 fi
 EOF
     chmod +x "$PRIV_SCRIPT"
-    echo ":: Syncing Omarchy MangoWC binaries and share files into /usr..."
+    echo ":: Syncing Mangomarchy binaries and share files into /usr..."
     run_priv "$PRIV_SCRIPT"
     echo ":: Sync complete."
     ;;
 
   use-sddm)
-    PRIV_SCRIPT=$(mktemp /tmp/omarchy-mango-dm.XXXXXX.sh)
+    PRIV_SCRIPT=$(mktemp /tmp/mangomarchy-dm.XXXXXX.sh)
     trap 'rm -f "$PRIV_SCRIPT"' EXIT
 
     cat >"$PRIV_SCRIPT" <<EOF

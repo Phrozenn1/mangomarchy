@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Mangomarchy
+Comment=Omarchy MangoWC session managed by uwsm
+Exec=uwsm start -g -1 -e -D mango mangomarchy-session
+TryExec=mangomarchy-session
+Type=Application
+DesktopNames=mango;wlroots
